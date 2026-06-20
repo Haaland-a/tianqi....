@@ -1,0 +1,27 @@
+# Multi-Weather Dataset Configuration
+# 多天气数据集配置（雾天fog+霾haze+雨天+雪天）
+
+# Dataset root directory
+path: ../multi_weather_dataset
+
+# Train/Val paths - 包含所有天气类型
+train:
+  - fog/images
+  - haze/images
+  - rain/images
+  - snow/images
+
+val:
+  - fog/images
+  - haze/images
+  - rain/images
+  - snow/images
+
+# Classes definition
+names:
+  0: 自行车
+  1: 摩托车
+  2: 汽车
+  3: 人
+
+nc: 4

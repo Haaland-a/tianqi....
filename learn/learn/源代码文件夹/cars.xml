@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<opencv_storage>
+<haarcascade_car type_id="opencv-haar-classifier">
+  <size>20 20</size>
+  <stages>
+    <!-- 基础特征层（实际需要完整数据） -->
+    <_>
+      <trees>
+        <_>
+          <feature>
+            <rects>
+              <_>1 1 18 18 -1.</_>
+              <_>1 1 9 9 2.</_></rects>
+            <tilted>0</tilted></feature>
+          <threshold>0.01</threshold>
+          <left_val>0.5</left_val>
+          <right_val>0.8</right_val></_></trees>
+      <stage_threshold>1.5</stage_threshold></_>
+  </stages>
+</haarcascade_car>
+</opencv_storage>

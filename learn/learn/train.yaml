@@ -1,0 +1,13 @@
+# Train/Val paths - zuiyou 数据集
+path: ../../../zuiyou_labels
+
+train: images
+val: images
+
+names:
+  0: 自行车
+  1: 摩托车
+  2: 汽车
+  3: 人
+
+nc: 4
