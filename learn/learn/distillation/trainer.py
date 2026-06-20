@@ -67,17 +67,9 @@ def count_params(model, trainable_only=False):
 # YOLO Neck 特征提取器 (学生网络用)
 # ==============================================================================
 class YOLOFeatureExtractor:
-    """通过钩子捕获 YOLO 模型中间层特征"""
+    """通过钩子捕获 YOLO 模型中间层特征 (不额外运行前向)"""
 
     def __init__(self, model, layer_indices=(15, 22, 25)):
-        """
-        Args:
-            model: ultralytics DetectionModel
-            layer_indices: 要捕获的层索引
-                15: P3/8 (FCA融合后)
-                22: P4/16
-                25: P5/32
-        """
         self.model = model
         self.layer_indices = layer_indices
         self.features = {}
@@ -86,13 +78,12 @@ class YOLOFeatureExtractor:
         for idx in layer_indices:
             if idx < len(model.model):
                 handle = model.model[idx].register_forward_hook(
-                    lambda m, i, o, _idx=idx: self.features.update({_idx: o})
+                    lambda m, i, o, _idx=idx: self.features.update({_idx: o.detach()})
                 )
                 self.handles.append(handle)
 
-    def get_features(self, x):
-        self.features = {}
-        _ = self.model(x)
+    def get_features(self):
+        """返回最近一次前向传播缓存的特征 (不重新运行模型)"""
         feats = []
         for idx in sorted(self.layer_indices):
             if idx in self.features and self.features[idx] is not None:
@@ -295,7 +286,7 @@ class DualTeacherDistillTrainer:
                 # 标准 YOLO 训练前向
                 student_out = self.student_model(imgs)
                 # 获取学生 Neck 特征 (用于蒸馏)
-                student_feats = self.student_extractor.get_features(imgs)
+                student_feats = self.student_extractor.get_features()
 
                 # 检测损失 (使用 ultralytics 内置)
                 # 需要构建目标格式
@@ -304,7 +295,7 @@ class DualTeacherDistillTrainer:
             else:
                 with torch.no_grad():
                     student_out = self.student_model(imgs)
-                    student_feats = self.student_extractor.get_features(imgs)
+                    student_feats = self.student_extractor.get_features()
                     targets = self._build_targets(batch, student_out)
                     det_loss, det_loss_items = self.det_loss_fn(student_out, targets)
 

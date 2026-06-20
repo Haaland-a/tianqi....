@@ -46,8 +46,8 @@ def get_default_config():
         "spt_weights_path": os.path.join(
             _PROJECT_DIR, "runs", "fca_detect", "train_fca_cl", "weights", "best.pt"
         ),
-        # IRT 教师: AOD-Net 预训练权重 (可选，None 则随机初始化)
-        "irt_pretrained_path": None,
+        # IRT 教师: AOD-Net 预训练权重 (dehazer.pth 已下载到本目录)
+        "irt_pretrained_path": os.path.join(_BASE_DIR, "dehazer.pth"),
         # 学生模型: YOLOv8-FCA yaml 配置
         "student_yaml": os.path.join(
             _PROJECT_DIR, "ultralytics-main", "ultralytics", "cfg",

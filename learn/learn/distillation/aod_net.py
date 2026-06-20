@@ -9,6 +9,7 @@ AOD-Net (All-in-One Dehazing Network) — IRT 不变重建教师
   2. 通过 Sobel 算子提取底层轮廓特征，用于与学生网络做 MSE 蒸馏
   3. 全程冻结，不参与反向传播
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,12 +55,23 @@ class AODNet(nn.Module):
         return restored, k
 
     def load_pretrained(self, weights_path):
-        """加载预训练权重"""
+        """加载预训练权重，自动适配键名"""
         state = torch.load(weights_path, map_location="cpu", weights_only=True)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
-        self.load_state_dict(state, strict=False)
-        print(f"[IRT] AOD-Net 预训练权重已加载: {weights_path}")
+        # 键名映射: 外部权重可能使用不同前缀 (如 e_conv1 → conv1)
+        new_state = {}
+        our_keys = dict(self.named_parameters())
+        for k, v in state.items():
+            k_clean = k.replace("e_conv", "conv").replace("module.", "")
+            if k_clean in our_keys and v.shape == our_keys[k_clean].shape:
+                new_state[k_clean] = v
+            elif k in our_keys and v.shape == our_keys[k].shape:
+                new_state[k] = v
+        loaded = len(new_state)
+        total = len(our_keys)
+        self.load_state_dict(new_state, strict=False)
+        print(f"[IRT] AOD-Net 预训练权重已加载: {weights_path} ({loaded}/{total} 个参数匹配)")
 
 
 # ==============================================================================

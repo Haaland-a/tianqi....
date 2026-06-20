@@ -100,11 +100,9 @@ class SPTDistillLoss(nn.Module):
             for sc, tc in zip(student_channels, spt_channels)
         ])
         # 多尺度权重: P5 深层语义权重最高
-        self.layer_weights = nn.ParameterList([
-            nn.Parameter(torch.tensor(0.3)),   # P3
-            nn.Parameter(torch.tensor(0.3)),   # P4
-            nn.Parameter(torch.tensor(0.4)),   # P5
-        ])
+        self.w_p3 = nn.Parameter(torch.tensor(0.3))
+        self.w_p4 = nn.Parameter(torch.tensor(0.3))
+        self.w_p5 = nn.Parameter(torch.tensor(0.4))
 
     def forward(self, student_feats, spt_feats):
         """
@@ -119,14 +117,13 @@ class SPTDistillLoss(nn.Module):
 
         losses = []
         for i, (sf, tf) in enumerate(zip(student_feats, spt_feats)):
-            # 尺寸对齐 (SPT 和 Student 可能输出不同尺寸)
             if sf.shape[2:] != tf.shape[2:]:
                 tf = F.interpolate(tf, size=sf.shape[2:], mode="bilinear", align_corners=False)
             loss_i = self.alignments[i](sf, tf)
-            # 归一化权重
-            losses.append(loss_i * self.layer_weights[i])
+            w = [self.w_p3, self.w_p4, self.w_p5][i]
+            losses.append(loss_i * w)
 
-        total = sum(losses) / sum(p for p in self.layer_weights)
+        total = sum(losses) / sum([self.w_p3, self.w_p4, self.w_p5])
         return total
 
 
