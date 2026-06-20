@@ -9,6 +9,7 @@ AOD-Net (All-in-One Dehazing Network) — IRT 不变重建教师
   2. 通过 Sobel 算子提取底层轮廓特征，用于与学生网络做 MSE 蒸馏
   3. 全程冻结，不参与反向传播
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
