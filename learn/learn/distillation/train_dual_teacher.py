@@ -8,11 +8,14 @@
     1. 运行 setup_dataset.py 创建 8:1:1 数据集
     2. 确保 SPT 教师权重 (best.pt) 已存在
     3. 确保 ultralytics-main 在 sys.path 中
+    4. 确保 omnirestore/ 权重已下载 (ckpts/best.ckpt, logs/embedder.pt)
 
 架构:
     SPT (语义教师, 冻结) ──→ Neck 语义特征 ──┐
                                               ├──→ 学生 YOLO-FCA
     IRT (重建教师, 冻结) ──→ 边缘轮廓特征 ──┘
+
+    IRT 默认使用 OmniRestore (多天气复原), 可回退到 AOD-Net
 
 训练:
     Stage 1: 冻结 Backbone, 训练 Neck/FCA/Head, LR=1e-3, 30 epochs
@@ -46,8 +49,13 @@ def get_default_config():
         "spt_weights_path": os.path.join(
             _PROJECT_DIR, "runs", "fca_detect", "train_fca_cl", "weights", "best.pt"
         ),
-        # IRT 教师: AOD-Net 预训练权重 (dehazer.pth 已下载到本目录)
+        # IRT 教师: 默认使用 OmniRestore, 回退使用 AOD-Net
         "irt_pretrained_path": os.path.join(_BASE_DIR, "dehazer.pth"),
+        # OmniRestore 权重路径
+        "omnirestore_ckpt": os.path.join(_BASE_DIR, "omnirestore", "ckpts", "best.ckpt"),
+        "omnirestore_embedder": os.path.join(_BASE_DIR, "omnirestore", "logs", "embedder.pt"),
+        # 是否使用 OmniRestore (False 则回退到 AOD-Net)
+        "use_omnirestore": True,
         # 学生模型: YOLOv8-FCA yaml 配置
         "student_yaml": os.path.join(
             _PROJECT_DIR, "ultralytics-main", "ultralytics", "cfg",
@@ -75,12 +83,8 @@ def get_default_config():
 
         # ── 蒸馏权重 ──
         # λ1: IRT 蒸馏权重, 范围建议 [0.1, 1.0]
-        #   值越大, 学生越依赖 IRT 的边缘/重建特征
-        #   如果学生检测结果中边缘信息不足, 可增大
         "lambda_irt": 0.3,
         # λ2: SPT 蒸馏权重, 范围建议 [0.5, 2.0]
-        #   值越大, 学生越模仿 SPT 的语义特征
-        #   如果学生检测精度不够, 可增大
         "lambda_spt": 1.0,
 
         # ── 保存 ──
@@ -99,6 +103,15 @@ def validate_config(cfg):
         issues.append(f"数据集目录不存在: {cfg['data_root']} (请先运行 setup_dataset.py)")
     if not os.path.exists(cfg["spt_weights_path"]):
         issues.append(f"SPT 教师权重不存在: {cfg['spt_weights_path']} (请先训练基础 YOLO-FCA 模型)")
+
+    if cfg.get("use_omnirestore", True):
+        if not os.path.exists(cfg.get("omnirestore_ckpt", "")):
+            issues.append(f"OmniRestore 权重不存在: {cfg['omnirestore_ckpt']} (请下载)")
+        if not os.path.exists(cfg.get("omnirestore_embedder", "")):
+            issues.append(f"OmniRestore Embedder 不存在: {cfg['omnirestore_embedder']} (请下载)")
+    else:
+        if not os.path.exists(cfg["irt_pretrained_path"]):
+            issues.append(f"AOD-Net 权重不存在: {cfg['irt_pretrained_path']}")
 
     if issues:
         print("\n⚠️  配置检查发现以下问题:")

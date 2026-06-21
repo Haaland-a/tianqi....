@@ -201,6 +201,140 @@ def create_irt_teacher(output_channels=256, pretrained_path=None):
     return teacher
 
 
+# ==============================================================================
+# OmniRestore 教师 — 替代 AOD-Net 的多天气复原教师
+# ==============================================================================
+OMNIRESTORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omnirestore")
+
+def _add_omnirestore_path():
+    """将 omnirestore 子模块加入 sys.path"""
+    if OMNIRESTORE_DIR not in sys.path:
+        sys.path.insert(0, OMNIRESTORE_DIR)
+
+class OmniRestoreTeacher(nn.Module):
+    """
+    OmniRestore 多天气复原教师 (CVPR 2026 Workshop)
+
+    使用 OmniRestore (WADNet + CLIP-KAN embedder) 复原图像，
+    再通过 Sobel 算子提取边缘轮廓特征用于蒸馏。
+    全程冻结，不参与反向传播。
+
+    使用方式:
+        teacher = OmniRestoreTeacher(output_channels=256, device="cuda")
+        restored_img, edge_feat = teacher(weather_image)
+    """
+
+    def __init__(self, output_channels=256, device="cuda",
+                 ckpt_path=None, embedder_path=None):
+        super().__init__()
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        _add_omnirestore_path()
+
+        # 默认权重路径
+        if ckpt_path is None:
+            ckpt_path = os.path.join(OMNIRESTORE_DIR, "ckpts", "best.ckpt")
+        if embedder_path is None:
+            embedder_path = os.path.join(OMNIRESTORE_DIR, "logs", "embedder.pt")
+
+        # ── 加载复原模型 (WADNet) ──
+        from model.wadt_net_no_shift import WADNet
+        self.restorer = WADNet(channel=16, embed_dim=512, window_size=8, use_windowed_sa=True)
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            model_states = ckpt.get("model_states", ckpt)
+            rest_w = model_states.get("restorer", model_states)
+            # 移除 DataParallel 前缀
+            rest_w = {k.replace("module.", "", 1) if k.startswith("module.") else k: v
+                      for k, v in rest_w.items()}
+            self.restorer.load_state_dict(rest_w, strict=True)
+            print(f"[OmniRestore] 复原模型权重加载: {ckpt_path}")
+        else:
+            print(f"[OmniRestore] ⚠️ 权重不存在: {ckpt_path}，使用随机初始化")
+
+        # ── 加载天气编码器 (CLIP-KAN embedder) ──
+        from model.embedder import ImageStyleEmbedder
+        self.embedder = ImageStyleEmbedder(backbone="resnet18", out_dim=512)
+        if os.path.exists(embedder_path):
+            emb_state = torch.load(embedder_path, map_location=self.device, weights_only=False)
+            if isinstance(emb_state, dict) and "state_dict" in emb_state:
+                emb_state = emb_state["state_dict"]
+            emb_state = {k.replace("module.", "", 1) if k.startswith("module.") else k: v
+                         for k, v in emb_state.items()}
+            self.embedder.load_state_dict(emb_state, strict=False)
+            print(f"[OmniRestore] 编码器权重加载: {embedder_path}")
+        else:
+            print(f"[OmniRestore] ⚠️ 编码器权重不存在: {embedder_path}")
+
+        # ── Sobel 边缘提取器 ──
+        self.edge_extractor = SobelEdgeExtractor(output_channels=output_channels)
+
+        # ── ImageNet 归一化参数 ──
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        self.to(self.device)
+        self.freeze()
+
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad = False
+        self.eval()
+        total = sum(p.numel() for p in self.parameters())
+        print(f"[OmniRestore] 教师已冻结，总参数: {total:,}")
+
+    def forward(self, weather_image):
+        """
+        Args:
+            weather_image: [B, 3, H, W] 值域 [0, 1]
+        Returns:
+            restored:  [B, 3, H, W] 复原图, 值域 [0, 1]
+            edge_feat: [B, out_c, H/2, W/2] 边缘轮廓特征
+        """
+        # ImageNet 归一化 (ResNet/CLIP 要求)
+        x_norm = (weather_image - self.imagenet_mean) / self.imagenet_std
+
+        with torch.no_grad():
+            img_emb = self.embedder.embed_for_style_transfer(x_norm)
+            restored, _, _, _ = self.restorer(x_norm, img_emb)
+            edge_feat = self.edge_extractor(restored)
+
+        return restored, edge_feat
+
+
+def create_omnirestore_teacher(output_channels=256, device="cuda",
+                                ckpt_path=None, embedder_path=None):
+    """工厂函数：创建 OmniRestore 教师"""
+    teacher = OmniRestoreTeacher(
+        output_channels=output_channels,
+        device=device,
+        ckpt_path=ckpt_path,
+        embedder_path=embedder_path,
+    )
+    teacher.freeze()
+    return teacher
+
+
+# ==============================================================================
+# 兼容: 保留原有的 IRTTeacher 工厂，默认使用 OmniRestore
+# ==============================================================================
+def create_irt_teacher(output_channels=256, pretrained_path=None, use_omnirestore=True, **kwargs):
+    """
+    创建 IRT 教师（默认使用 OmniRestore)
+    Args:
+        use_omnirestore: True 使用 OmniRestore, False 使用 AOD-Net
+    """
+    if use_omnirestore:
+        return create_omnirestore_teacher(output_channels=output_channels, **kwargs)
+    # 回退到 AOD-Net
+    teacher = IRTTeacher(output_channels=output_channels)
+    if pretrained_path is not None and os.path.exists(pretrained_path):
+        teacher.load_aod_weights(pretrained_path)
+    else:
+        print("[IRT] 未找到预训练权重，使用随机初始化。")
+    teacher.freeze()
+    return teacher
+
+
 # 测试入口
 if __name__ == "__main__":
     import os
@@ -212,3 +346,17 @@ if __name__ == "__main__":
     print(f"复原图: {restored.shape}")      # [2, 3, 640, 640]
     print(f"边缘特征: {edge.shape}")        # [2, 256, 320, 320]
     print(f"总参数:  {sum(p.numel() for p in teacher.parameters()):,}")
+
+    # OmniRestore 测试
+    print("\n" + "=" * 50)
+    print("OmniRestore 教师测试")
+    print("=" * 50)
+    try:
+        omni = create_omnirestore_teacher(output_channels=256)
+        restored2, edge2 = omni(dummy.cuda() if torch.cuda.is_available() else dummy)
+        print(f"输入:      {dummy.shape}")
+        print(f"复原图:    {restored2.shape}")
+        print(f"边缘特征:  {edge2.shape}")
+        print(f"总参数:    {sum(p.numel() for p in omni.parameters()):,}")
+    except Exception as e:
+        print(f"OmniRestore 加载失败 (可能需要安装依赖): {e}")

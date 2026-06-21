@@ -28,8 +28,13 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 
+# ── OmniRestore 路径 ──
+_OMNIDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omnirestore")
+if os.path.isdir(_OMNIDIR):
+    sys.path.insert(0, _OMNIDIR)
+
 # ── 项目模块 ──────────────────────────────────────────────────────────
-from aod_net import IRTTeacher, create_irt_teacher
+from aod_net import IRTTeacher, create_irt_teacher, create_omnirestore_teacher
 from spt_teacher import SPTTeacher, create_spt_teacher
 from losses import DualTeacherDistillLoss
 from dataset import create_dataloaders
@@ -126,7 +131,7 @@ class DualTeacherDistillTrainer:
     双教师知识蒸馏训练器
 
     前向传播逻辑:
-      1. 天气原图 → IRT 教师 (AOD-Net) → 复原图 + 边缘特征
+      1. 天气原图 → IRT 教师 (OmniRestore/AOD-Net) → 复原图 + 边缘特征
       2. 天气原图 → SPT 教师 (YOLO-FCA) → Neck 语义特征
       3. 天气原图 → 学生 YOLO-FCA → 检测结果 + Neck 特征
       4. 计算 Det_Loss + IRT_Distill + SPT_Distill
@@ -192,13 +197,24 @@ class DualTeacherDistillTrainer:
         else:
             logger.warning(f"[Init] SPT 权重不存在: {spt_path}，将在第一阶段使用降级模式")
 
-        # IRT 教师 — AOD-Net
-        irt_pretrained = self.cfg.get("irt_pretrained_path", None)
-        self.irt_teacher = create_irt_teacher(
-            output_channels=256, pretrained_path=irt_pretrained
-        )
-        self.irt_teacher = self.irt_teacher.to(self.device)
-        logger.info("[Init] IRT 教师: AOD-Net + Sobel, 已冻结")
+        # IRT 教师 — 默认 OmniRestore, 可回退到 AOD-Net
+        use_omnirestore = self.cfg.get("use_omnirestore", True)
+        if use_omnirestore:
+            self.irt_teacher = create_omnirestore_teacher(
+                output_channels=256,
+                device=str(self.device),
+                ckpt_path=self.cfg.get("omnirestore_ckpt"),
+                embedder_path=self.cfg.get("omnirestore_embedder"),
+            )
+            logger.info("[Init] IRT 教师: OmniRestore (WADNet + CLIP-KAN), 已冻结")
+        else:
+            irt_pretrained = self.cfg.get("irt_pretrained_path", None)
+            self.irt_teacher = create_irt_teacher(
+                output_channels=256, pretrained_path=irt_pretrained,
+                use_omnirestore=False,
+            )
+            self.irt_teacher = self.irt_teacher.to(self.device)
+            logger.info("[Init] IRT 教师: AOD-Net + Sobel, 已冻结")
 
     def _build_student(self):
         """创建学生 YOLO-FCA 模型"""
@@ -408,10 +424,11 @@ class DualTeacherDistillTrainer:
         freeze_backbone(self.student_model)
         logger.info(f"可训练参数: {count_params(self.student_model, trainable_only=True):,}")
 
-        # 优化器
-        trainable_params = [p for p in self.student_model.parameters() if p.requires_grad]
-        optimizer = optim.AdamW(trainable_params, lr=self.cfg.get("stage1_lr", 1e-3),
-                                weight_decay=1e-4)
+        # 优化器 (包含蒸馏损失投影层)
+        distill_params = list(self.distill_loss_fn.parameters())
+        student_params = [p for p in self.student_model.parameters() if p.requires_grad]
+        optimizer = optim.AdamW(distill_params + student_params,
+                                lr=self.cfg.get("stage1_lr", 1e-3), weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.cfg.get("stage1_epochs", 30)
         )
@@ -474,9 +491,10 @@ class DualTeacherDistillTrainer:
         unfreeze_all(self.student_model)
         logger.info(f"可训练参数: {count_params(self.student_model, trainable_only=True):,}")
 
-        # 优化器 (更低学习率)
-        optimizer = optim.AdamW(self.student_model.parameters(),
-                                lr=self.cfg.get("stage2_lr", 1e-4), weight_decay=1e-4)
+        # 优化器 (包含蒸馏损失投影层)
+        optimizer = optim.AdamW(
+            list(self.distill_loss_fn.parameters()) + list(self.student_model.parameters()),
+            lr=self.cfg.get("stage2_lr", 1e-4), weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.cfg.get("stage2_epochs", 50)
         )
