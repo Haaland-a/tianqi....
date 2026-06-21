@@ -355,6 +355,49 @@ class DualTeacherDistillTrainer:
 
     # ── 公开训练接口 ─────────────────────────────────────────────────
 
+    def _run_map_eval(self, desc="Val"):
+        """使用 ultralytics 内置 val() 计算 mAP"""
+        if not hasattr(self, "student") or self.student is None:
+            return {}
+        try:
+            data_yaml = self.cfg.get("data_yaml")
+            if not data_yaml or not os.path.exists(data_yaml):
+                logger.warning(f"[mAP] data_yaml 不存在: {data_yaml}")
+                return {}
+
+            results = self.student.val(
+                data=data_yaml,
+                imgsz=self.cfg.get("img_size", 640),
+                batch=self.cfg.get("batch_size", 8),
+                device=self.device,
+                split="val",          # 使用 val 集
+                plots=False,
+                save_json=False,
+                verbose=False,
+            )
+
+            # 提取 mAP (兼容不同 ultralytics 版本)
+            if hasattr(results, "box"):
+                ap50 = float(getattr(results.box, "map50", 0))
+                ap75 = float(getattr(results.box, "map75", 0))
+                ap50_95 = float(getattr(results.box, "map", 0))
+            else:
+                ap50 = float(getattr(results, "box_map50", 0))
+                ap75 = float(getattr(results, "box_map75", 0))
+                ap50_95 = float(getattr(results, "box_map", 0))
+
+            metrics = {
+                "mAP50": float(ap50),
+                "mAP75": float(ap75),
+                "mAP50_95": float(ap50_95),
+            }
+            logger.info(f"[{desc}] mAP50={ap50:.4f}, mAP75={ap75:.4f}, mAP50:95={ap50_95:.4f}")
+            return metrics
+
+        except Exception as e:
+            logger.warning(f"[mAP] 评估失败: {e}")
+            return {}
+
     def train_stage1(self):
         """第一阶段: 冻结 backbone + 教师，训练 neck + FCA + head"""
         logger.info("\n" + "=" * 60)
@@ -381,18 +424,28 @@ class DualTeacherDistillTrainer:
                                             desc=f"S1 Train [{epoch}/{epochs}]")
             scheduler.step()
 
-            # 验证
-            val_metrics = None
+            # 验证 (loss + mAP)
+            val_metrics = {}
             if self.val_loader and epoch % 5 == 0:
                 val_metrics = self._run_epoch(self.val_loader, desc=f"S1 Val [{epoch}]")
+                map_metrics = self._run_map_eval(desc=f"S1 Val [{epoch}]")
+                if map_metrics and map_metrics.get("mAP50_95", 0) > self.best_map:
+                    self.best_map = map_metrics["mAP50_95"]
+                    best_ckpt = self.save_dir / "stage1_best_map.pt"
+                    torch.save(self.student_model.state_dict(), best_ckpt)
+                    logger.info(f"[S1] 最佳 mAP 模型保存: {best_ckpt} ({self.best_map:.4f})")
 
             # 日志
             lr = optimizer.param_groups[0]["lr"]
+            map_str = ""
+            if val_metrics:
+                map_str = f" | mAP50={map_metrics.get('mAP50', 0):.4f}" if map_metrics else ""
             logger.info(f"S1 Epoch {epoch:3d}/{epochs} | LR {lr:.2e} | "
                         f"Loss {train_metrics['loss']:.4f} | "
                         f"Det {train_metrics['det_loss']:.4f} | "
                         f"IRT {train_metrics['irt_distill']:.4f} | "
-                        f"SPT {train_metrics['spt_distill']:.4f}")
+                        f"SPT {train_metrics['spt_distill']:.4f}"
+                        f"{map_str}")
 
             # 保存检查点
             if epoch % 10 == 0 or epoch == epochs:
@@ -436,16 +489,26 @@ class DualTeacherDistillTrainer:
                                             desc=f"S2 Train [{epoch}/{epochs}]")
             scheduler.step()
 
-            val_metrics = None
+            val_metrics = {}
             if self.val_loader and epoch % 5 == 0:
                 val_metrics = self._run_epoch(self.val_loader, desc=f"S2 Val [{epoch}]")
+                map_metrics = self._run_map_eval(desc=f"S2 Val [{epoch}]")
+                if map_metrics and map_metrics.get("mAP50_95", 0) > self.best_map:
+                    self.best_map = map_metrics["mAP50_95"]
+                    best_ckpt = self.save_dir / "stage2_best_map.pt"
+                    torch.save(self.student_model.state_dict(), best_ckpt)
+                    logger.info(f"[S2] 最佳 mAP 模型保存: {best_ckpt} ({self.best_map:.4f})")
 
             lr = optimizer.param_groups[0]["lr"]
+            map_str = ""
+            if val_metrics:
+                map_str = f" | mAP50={map_metrics.get('mAP50', 0):.4f}" if map_metrics else ""
             logger.info(f"S2 Epoch {epoch:3d}/{epochs} | LR {lr:.2e} | "
                         f"Loss {train_metrics['loss']:.4f} | "
                         f"Det {train_metrics['det_loss']:.4f} | "
                         f"IRT {train_metrics['irt_distill']:.4f} | "
-                        f"SPT {train_metrics['spt_distill']:.4f}")
+                        f"SPT {train_metrics['spt_distill']:.4f}"
+                        f"{map_str}")
 
             if epoch % 10 == 0 or epoch == epochs:
                 ckpt_path = self.save_dir / f"stage2_epoch{epoch}.pt"

@@ -109,26 +109,151 @@ class PairedWeatherDataset(Dataset):
 
         return img, labels, (r, left, top)
 
-    def __getitem__(self, idx):
+    def _load_sample(self, idx):
+        """按索引加载一张图像+标签"""
         img_path, lbl_path = self.samples[idx]
-
-        # 加载
-        img_raw = self._load_image(img_path)
-        h0, w0 = img_raw.shape[:2]
+        img = self._load_image(img_path)
+        h0, w0 = img.shape[:2]
         labels = self._load_labels(lbl_path, h0, w0)
+        return img, labels, (h0, w0), img_path, lbl_path
 
-        # resize + letterbox
-        img_resized, labels, (r, left, top) = self._resize_and_pad(img_raw, labels)
+    def _mosaic_augment(self, idx):
+        """
+        Mosaic 增强: 将 4 张图像拼成 2×2 网格
+        返回拼图 + 融合后的标签
+        """
+        # 随机选择 3 张额外图像
+        indices = [idx] + [np.random.randint(len(self.samples)) for _ in range(3)]
+        mosaic_imgs = []
+        mosaic_labels = []
+        sizes = []
+
+        for i in indices:
+            img, labels, (h, w), _, _ = self._load_sample(i)
+            mosaic_imgs.append(img)
+            mosaic_labels.append(labels)
+            sizes.append((h, w))
+
+        # 随机中心点
+        s = self.img_size
+        cx = int(np.random.uniform(s // 3, 2 * s // 3))
+        cy = int(np.random.uniform(s // 3, 2 * s // 3))
+        sx4 = [cx, s - cx, cx, s - cx]
+        sy4 = [cy, cy, s - cy, s - cy]
+
+        # 构建 mosaic
+        mosaic = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
+        all_labels = []
+
+        for i, (img_i, (h_i, w_i)) in enumerate(zip(mosaic_imgs, sizes)):
+            # 随机缩放
+            scale = min(s / max(h_i, w_i), 2.0)
+            scale *= np.random.uniform(0.5, 1.5)
+            new_h, new_w = int(h_i * scale), int(w_i * scale)
+            if new_h == 0 or new_w == 0:
+                continue
+            img_i = cv2.resize(img_i, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            # 放置到四象限
+            xi, yi = (i % 2), (i // 2)
+            x_start = cx - new_w if xi == 0 else cx
+            y_start = cy - new_h if yi == 0 else cy
+            x_start = max(0, x_start)
+            y_start = max(0, y_start)
+            x_end = min(s * 2, x_start + new_w)
+            y_end = min(s * 2, y_start + new_h)
+            # 实际粘贴区域
+            paste_w = x_end - x_start
+            paste_h = y_end - y_start
+            if paste_w <= 0 or paste_h <= 0:
+                continue
+            img_crop = img_i[:paste_h, :paste_w]
+            mosaic[y_start:y_end, x_start:x_end] = img_crop
+
+            # 标签坐标转换
+            if len(mosaic_labels[i]) > 0:
+                lbl = mosaic_labels[i].copy()
+                scale_x = (x_end - x_start) / new_w
+                scale_y = (y_end - y_start) / new_h
+                lbl[:, 1] = lbl[:, 1] * new_w * scale_x + x_start
+                lbl[:, 2] = lbl[:, 2] * new_h * scale_y + y_start
+                lbl[:, 3] = lbl[:, 3] * new_w * scale_x
+                lbl[:, 4] = lbl[:, 4] * new_h * scale_y
+                # 滤除超出边界的标签
+                keep = (
+                    (lbl[:, 1] > 0) & (lbl[:, 1] < s * 2) &
+                    (lbl[:, 2] > 0) & (lbl[:, 2] < s * 2) &
+                    (lbl[:, 3] > 0) & (lbl[:, 4] > 0)
+                )
+                lbl = lbl[keep]
+                if len(lbl) > 0:
+                    lbl[:, 1] = np.clip(lbl[:, 1], 0, s * 2)
+                    lbl[:, 2] = np.clip(lbl[:, 2], 0, s * 2)
+                    all_labels.append(lbl)
+
+        # 缩放到 img_size
+        mosaic = cv2.resize(mosaic, (s, s), interpolation=cv2.INTER_LINEAR)
+
+        # 标签归一化
+        if all_labels:
+            labels = np.concatenate(all_labels, axis=0)
+            # 检查标签有效性
+            labels[:, 1] = np.clip(labels[:, 1] / (s * 2), 0.01, 0.99)
+            labels[:, 2] = np.clip(labels[:, 2] / (s * 2), 0.01, 0.99)
+            labels[:, 3] = np.clip(labels[:, 3] / (s * 2), 0.001, 0.99)
+            labels[:, 4] = np.clip(labels[:, 4] / (s * 2), 0.001, 0.99)
+        else:
+            labels = np.zeros((0, 5), dtype=np.float32)
+
+        return mosaic, labels
+
+    def _apply_hsv_augment(self, img):
+        """HSV 颜色抖动"""
+        if np.random.random() < 0.5:
+            h_gain, s_gain, v_gain = 0.015, 0.7, 0.4
+            r = np.random.uniform(-1, 1, 3) * [h_gain, s_gain, v_gain] + 1
+            hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+            hsv[:, :, 0] = (hsv[:, :, 0] * r[0]) % 180
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * r[1], 0, 255)
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * r[2], 0, 255)
+            img = hsv.astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_HSV2RGB)
+        return img
+
+    def _apply_flip(self, img, labels):
+        """随机水平翻转"""
+        if np.random.random() < 0.5:
+            img = np.fliplr(img).copy()
+            if len(labels) > 0:
+                labels[:, 1] = 1.0 - labels[:, 1]
+        return img, labels
+
+    def __getitem__(self, idx):
+        if self.augment and np.random.random() < 0.5:
+            # Mosaic 增强
+            img, labels = self._mosaic_augment(idx)
+            img_path = str(self.samples[idx][0])
+        else:
+            # 正常加载
+            img_raw, labels, (h0, w0), img_path, _ = self._load_sample(idx)
+            # resize + letterbox
+            img_resized, labels, (r, left, top) = self._resize_and_pad(img_raw, labels)
+            img = img_resized
+
+        # 增强 (仅训练)
+        if self.augment:
+            img = self._apply_hsv_augment(img)
+            img, labels = self._apply_flip(img, labels)
 
         # HWC → CHW, [0,255] → [0,1]
-        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
         return {
             "img": img_tensor,                       # [3, 640, 640]
             "labels": torch.from_numpy(labels),      # [N, 5]
             "img_path": str(img_path),
-            "shape": (h0, w0),                       # 原始尺寸
-            "ratio_pad": (r, left, top),              # resize 参数
+            "shape": (img.shape[0], img.shape[1]),   # 增强后的尺寸
+            "ratio_pad": (1, 0, 0),                   # 简化
         }
 
 
