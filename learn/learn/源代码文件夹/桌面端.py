@@ -15,6 +15,10 @@ from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon, QPalette
 from PyQt5.QtMultimedia import QSound
 from ultralytics import YOLO
 
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_BASE_DIR, 'ultralytics-main'))
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # 日志记录
 logging.basicConfig(
     filename='traffic_detection.log',
