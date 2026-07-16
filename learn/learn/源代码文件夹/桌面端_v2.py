@@ -228,17 +228,66 @@ class Worker:
         self.false_negatives = 0
 
     def load_model(self, model_path):
-        """加载模型 - 支持 FCA 模型"""
+        """加载模型 - 支持标准 YOLO 权重和蒸馏 state_dict"""
         try:
             if not os.path.exists(model_path):
                 logging.error(f"模型文件不存在: {model_path}")
                 return False
-            
-            self.model = YOLO(model_path)
-            logging.info(f"模型加载成功: {model_path}, 类别: {self.model.names}")
+
+            # 先尝试作为完整 checkpoint 加载
+            try:
+                self.model = YOLO(model_path)
+                logging.info(f"模型加载成功: {model_path}, 类别: {self.model.names}")
+                return True
+            except Exception:
+                pass  # 可能是 state_dict-only 文件
+
+            # 尝试作为 state_dict 加载（蒸馏产出的 stage_final.pt 等）
+            import torch
+            from ultralytics.nn.tasks import DetectionModel
+            from ultralytics.utils import DEFAULT_CFG_DICT
+
+            ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
+            if "model" in ckpt:
+                ckpt = ckpt["model"]
+
+            # 推断类别数
+            nc = 4
+            for k in ckpt:
+                if '.cv2.' in k and '.weight' in k and not k.endswith('.bias'):
+                    nc = ckpt[k].shape[0]
+                    if nc > 80:
+                        nc = nc // 16 if nc % 16 == 0 else 4
+                    break
+
+            # 找 FCA yaml
+            fca_yaml = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..",
+                "ultralytics-main", "ultralytics", "cfg", "models", "v8", "yolov8-fca.yaml"
+            )
+            if not os.path.exists(fca_yaml):
+                import ultralytics
+                fca_yaml = os.path.join(os.path.dirname(ultralytics.__file__),
+                                        "cfg", "models", "v8", "yolov8-fca.yaml")
+            if not os.path.exists(fca_yaml):
+                logging.error(f"FCA yaml 不存在: {fca_yaml}")
+                return False
+
+            # 重建模型
+            self.model = YOLO(fca_yaml, task="detect")
+            new_model = DetectionModel(fca_yaml, nc=nc)
+            new_model.args = type('Args', (), dict(DEFAULT_CFG_DICT))()
+            new_model.nc = nc
+            new_model.names = {i: str(i) for i in range(nc)}
+            new_model.load_state_dict(ckpt, strict=False)
+            self.model.model = new_model
+            self.model.overrides["task"] = "detect"
+
+            logging.info(f"state_dict 加载成功: {model_path}, nc={nc}")
             return True
+
         except Exception as e:
-            logging.error(f"加载模型失败: {str(e)}")
+            logging.error(f"加载模型失败: {str(e)}\n{traceback.format_exc()}")
             return False
 
     def detect_image(self, image):
@@ -602,19 +651,34 @@ class MainWindow(QMainWindow):
     def on_error(self, message):
         self.log_message(f"错误: {message}")
     
-    def display_image(self, cv_image, label):
-        """在 QLabel 上显示 OpenCV 图像"""
+    def display_image(self, cv_image, label, max_size=700):
+        """在 QLabel 上显示 OpenCV 图像（BGR 格式）"""
         if cv_image is None:
+            label.setText("无图像")
             return
-        
-        rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        
-        pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label.setPixmap(scaled_pixmap)
+
+        if not isinstance(cv_image, np.ndarray):
+            return
+
+        if cv_image.dtype != np.uint8:
+            cv_image = cv_image.astype(np.uint8)
+
+        if len(cv_image.shape) == 2:
+            cv_image = cv2.cvtColor(cv_image, cv2.COLOR_GRAY2BGR)
+        elif cv_image.shape[2] == 4:
+            cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGRA2BGR)
+
+        height, width = cv_image.shape[:2]
+        scale = min(max_size / max(width, height), 1.0)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        if scale < 1.0:
+            cv_image = cv2.resize(cv_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+        bytes_per_line = 3 * new_width
+        qt_image = QImage(cv_image.data, new_width, new_height, bytes_per_line, QImage.Format_BGR888)
+        label.setPixmap(QPixmap.fromImage(qt_image))
+        label.setAlignment(Qt.AlignCenter)
 
 
 if __name__ == "__main__":
